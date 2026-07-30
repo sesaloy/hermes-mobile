@@ -1,0 +1,188 @@
+name: Build Hermes Mobile APK
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version name (e.g., 1.2)'
+        required: false
+        default: '1.1'
+      version_code:
+        description: 'Version code (integer)'
+        required: false
+        default: '2'
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options: [debug, release]
+
+env:
+  JAVA_VERSION: '21'
+  ANDROID_SDK_VERSION: '35'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --install \
+            "platforms;android-${{ env.ANDROID_SDK_VERSION }}" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973" \
+            "platform-tools" \
+            "cmdline-tools;latest" \
+            --sdk_root=$ANDROID_HOME
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'android/app/src/main/python/requirements-hermes-android.txt'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Write version info
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.event.inputs.version_code }}/" android/app/build.gradle
+          sed -i "s/versionName \"[^\"]*\"/versionName \"${{ github.event.inputs.version_name }}\"/" android/app/build.gradle
+
+      - name: Prune Python assets
+        run: |
+          find android/app/src/main/python -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+          find android/app/src/main/python -name '*.pyc' -delete
+          find android/app/src/main/python -name '*.pyo' -delete
+          rm -rf android/app/src/main/python/hermes_cli/tui_dist 2>/dev/null || true
+
+      - name: Restore Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Build debug APK
+        if: github.event.inputs.build_type != 'release' && !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --console=plain --no-daemon
+        env:
+          HERMES_PYTHON: python3
+
+      - name: Build release APK
+        if: github.event.inputs.build_type == 'release' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --console=plain --no-daemon
+        env:
+          HERMES_PYTHON: python3
+
+      - name: Verify APK metadata
+        run: |
+          APK=$(ls android/app/build/outputs/apk/debug/*.apk 2>/dev/null || ls android/app/build/outputs/apk/release/*.apk 2>/dev/null)
+          if [ -n "$APK" ]; then
+            echo "=== APK Size ==="
+            ls -lh "$APK"
+            echo "=== APK Badging ==="
+            ${ANDROID_HOME}/build-tools/35.0.0/aapt dump badging "$APK" | head -15
+          else
+            echo "No APK found!"
+            exit 1
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-mobile-apk-${{ github.sha }}
+          path: android/app/build/outputs/apk/**/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload mapping (release only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-mobile-mapping-${{ github.ref_name }}
+          path: android/app/build/outputs/mapping/release/mapping.txt
+          retention-days: 90
+          if-no-files-found: ignore
+
+  size-check:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hermes-mobile-apk-${{ github.sha }}
+      - name: Report APK sizes
+        run: |
+          echo "## APK Sizes" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          find . -name "*.apk" -exec ls -lh {} \; | \
+            awk '{print "|", $9, "|", $5, "|"}' >> $GITHUB_STEP_SUMMARY
+          ls -lh *.apk 2>/dev/null
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Run lint checks
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew lint --console=plain --no-daemon
+        continue-on-error: true
+
+      - name: Upload lint results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: android/app/build/reports/lint-results*.html
+          retention-days: 7
+          if-no-files-found: ignore

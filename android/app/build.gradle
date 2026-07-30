@@ -16,7 +16,8 @@ android {
         }
         python {
             version "3.11"
-            buildPython "C:/Program Files/Python311/python.exe"
+            def hermesPy = System.getenv("HERMES_PYTHON")
+            buildPython (hermesPy ?: "C:/Program Files/Python311/python.exe")
             pip {
                 install "-r", "src/main/python/requirements-hermes-android.txt"
             }
